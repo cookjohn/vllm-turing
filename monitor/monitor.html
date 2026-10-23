@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vLLM monitor</title>
+<style>
+:root { --bg:#0f1115; --pan:#171a21; --line:#262b36; --txt:#d7dae0; --dim:#8a93a6; --ok:#3fb950; --warn:#d29922;
+        --bad:#f85149; --blue:#58a6ff; --violet:#bc8cff; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--txt); font:13px/1.4 -apple-system,Segoe UI,Roboto,"Microsoft YaHei",sans-serif; }
+header { display:flex; flex-wrap:wrap; gap:6px 18px; align-items:center; padding:8px 12px; background:var(--pan); border-bottom:1px solid var(--line); }
+header b { color:#fff; }
+.kv { color:var(--dim); } .kv span { color:var(--txt); font-variant-numeric:tabular-nums; }
+.dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:middle; }
+#timeline { height:120px; background:var(--pan); border-bottom:1px solid var(--line); position:relative; }
+#timeline canvas { width:100%; height:100%; display:block; }
+#main { display:flex; height:calc(100vh - 165px); }
+#list { width:56%; overflow:auto; border-right:1px solid var(--line); }
+#detail { width:44%; overflow:auto; padding:10px 12px; }
+table { width:100%; border-collapse:collapse; }
+th, td { padding:4px 6px; border-bottom:1px solid var(--line); white-space:nowrap; text-align:left; font-variant-numeric:tabular-nums; }
+th { position:sticky; top:0; background:var(--pan); color:var(--dim); font-weight:normal; z-index:1; }
+tr:hover { background:#1c2029; cursor:pointer; } tr.sel { background:#202838; }
+td.last { max-width:280px; overflow:hidden; text-overflow:ellipsis; color:var(--dim); }
+.badge { padding:1px 6px; border-radius:9px; font-size:11px; font-weight:600; color:#0f1115; }
+.b-wait { background:var(--warn); } .b-gen { background:var(--ok); } .b-pause { background:var(--warn); }
+.b-stall { background:var(--bad); color:#fff; } .b-done { background:#3a4252; color:var(--txt); }
+.b-err { background:var(--bad); color:#fff; } .b-abort { background:var(--violet); } .b-long { background:var(--bad); color:#fff; }
+.warn { color:var(--warn); } .bad { color:var(--bad); } .ok { color:var(--ok); } .dim { color:var(--dim); }
+h3 { margin:12px 0 6px; font-size:13px; color:var(--blue); }
+.msg { border:1px solid var(--line); border-radius:6px; margin:6px 0; background:var(--pan); }
+.msg .role { padding:3px 8px; font-size:11px; color:var(--dim); border-bottom:1px solid var(--line); display:flex; justify-content:space-between; }
+.msg pre, pre.out { margin:0; padding:6px 8px; white-space:pre-wrap; word-break:break-word; font:12px/1.45 Consolas,"Cascadia Mono",monospace; }
+pre.out { background:var(--pan); border:1px solid var(--line); border-radius:6px; max-height:none; }
+pre.reason { color:#9aa4b8; font-style:italic; }
+.more { color:var(--blue); cursor:pointer; font-size:11px; padding:0 8px 6px; display:inline-block; }
+.grid { display:grid; grid-template-columns:max-content 1fr; gap:2px 12px; }
+.grid div:nth-child(odd) { color:var(--dim); }
+#journal { max-height:160px; overflow:auto; font:11px Consolas,monospace; color:#e3b341; white-space:pre-wrap; }
+button, select { background:#222836; color:var(--txt); border:1px solid var(--line); border-radius:5px; padding:2px 8px; cursor:pointer; }
+</style>
+</head>
+<body>
+<header id="hdr">
+  <b>vLLM monitor</b>
+  <span class="kv"><span id="health"></span></span>
+  <span class="kv">running <span id="running">-</span> · waiting <span id="waiting">-</span></span>
+  <span class="kv">KV cache <span id="kv">-</span></span>
+  <span class="kv">prefix hits <span id="phit">-</span></span>
+  <span class="kv">prompt <span id="ptps">-</span> tok/s · output <span id="gtps">-</span> tok/s</span>
+  <span class="kv">accepted/step <span id="acc">-</span></span>
+  <span class="kv" id="gpus"></span>
+  <span class="kv" id="idle"></span>
+  <span style="margin-left:auto" class="kv"><label><input type="checkbox" id="follow" checked> follow newest</label>
+    <button id="jbtn">vLLM warnings</button></span>
+</header>
+<div id="timeline"><canvas id="tl"></canvas></div>
+<div id="main">
+  <div id="list"><table><thead><tr>
+    <th>#</th><th>time</th><th>state</th><th>client</th><th>api</th><th>msgs</th><th>prompt tok</th><th>cached</th>
+    <th>wait</th><th>out tok</th><th>tok/s</th><th>since out</th><th>finish</th><th>last input</th>
+  </tr></thead><tbody id="rows"></tbody></table></div>
+  <div id="detail"><p class="dim">Select a request. Waiting = queue + prompt processing until the first output;
+    "since out" = time since the last streamed output (PAUSED &gt; 10 s, STALLED &gt; 30 s).</p>
+    <div id="journalbox" style="display:none"><h3>recent vLLM warnings / errors</h3><div id="journal"></div></div></div>
+</div>
+<script>
+const recs = new Map();          // id -> summary
+let sel = null, selDetail = null, srv = {}, clockSkew = 0;
+const $ = id => document.getElementById(id);
+const now = () => Date.now() / 1000 + clockSkew;
+const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const fmtT = t => t ? new Date(t * 1000).toLocaleTimeString([], {hour12:false}) : "";
+const fmtS = s => s == null ? "" : s < 60 ? s.toFixed(1) + " s" : Math.floor(s / 60) + " m " + Math.round(s % 60) + " s";
+const rid = id => id < 0 ? "h" + (-id) : "#" + id;     // h = reloaded from the logs after a monitor restart
+const fmtN = n => n == null ? "" : n >= 10000 ? (n / 1000).toFixed(1) + "k" : String(Math.round(n));
+
+function status(r) {
+  const t = now();
+  if (r.state === "error") return ["ERROR", "b-err"];
+  if (r.state === "aborted") return ["ABORTED", "b-abort"];
+  if (r.state === "done") return [r.finish === "length" ? "DONE·len" : "DONE", r.finish === "length" ? "b-pause" : "b-done"];
+  if (r.t_first == null) {
+    const w = t - r.t0, cls = w > 60 ? "b-long" : "b-wait";
+    if (r.v) {                                           // engine progress feed
+      if (String(r.v.status).startsWith("WAITING")) return ["QUEUED", cls];
+      if (r.v.computed < r.v.prompt) return ["PREFILL " + Math.floor(100 * r.v.computed / Math.max(r.v.prompt, 1)) + "%", cls];
+      return ["FIRST TOKEN…", cls];
+    }
+    if (srv.progress_feed) return ["PREPARING", cls];    // not in the engine yet: chat template + tokenization
+    return [w > 60 ? "LONG WAIT" : "WAITING", cls];
+  }
+  const since = t - (r.t_last || r.t_first);
+  if (since > 30) return ["STALLED", "b-stall"];
+  if (since > 10) return ["PAUSED", "b-pause"];
+  return ["GENERATING", "b-gen"];
+}
+
+function prefillEta(r) {                                // " · 2,200 tok/s, ETA 25 s" while the prompt is processed
+  if (r.t_first != null || r.t_end || !r.v || r.v.computed >= r.v.prompt) return "";
+  const rt = r.v_rate || srv.prompt_live;
+  if (!rt) return "";
+  return ` <span class="dim">· ${Math.round(rt)} tok/s, ETA ${fmtS((r.v.prompt - r.v.computed) / rt)}</span>`;
+}
+
+function rate(r) {
+  const n = r.completion_tokens || r.out_tok;
+  const end = r.t_end || r.t_last;
+  if (!r.t_first || !end || end - r.t_first < 0.5 || !n) return null;
+  return (n - 1) / (end - r.t_first);
+}
+
+function row(r) {
+  const [label, cls] = status(r);
+  const wait = r.t_first ? r.t_first - r.t0 : (r.t_end ? r.t_end - r.t0 : now() - r.t0);
+  const since = r.t_end ? null : r.t_last ? now() - r.t_last : null;
+  const ptok = r.prompt_tokens ? fmtN(r.prompt_tokens) : r.v ? fmtN(r.v.prompt) : r.est_prompt != null ? "~" + fmtN(r.est_prompt) : "~" + fmtN(r.prompt_chars / 3.2);
+  const cached = r.cached_tokens != null ? r.cached_tokens : r.v && r.v.cached >= 0 ? r.v.cached : null;
+  const eta = prefillEta(r);
+  const rt = rate(r);
+  const tools = r.tool_calls && r.tool_calls.length ? " ⚙ " + r.tool_calls.join(",") : "";
+  return `<td>${rid(r.id)}</td><td>${fmtT(r.t0)}</td><td><span class="badge ${cls}">${label}</span></td>` +
+    `<td title="${esc(r.ua)}">${esc(r.client)}</td><td>${r.kind}${r.stream ? "" : " (no stream)"}</td>` +
+    `<td>${r.n_msgs}${r.n_tools ? " / " + r.n_tools + "t" : ""}</td><td>${ptok}</td><td>${cached != null ? fmtN(cached) : ""}</td>` +
+    `<td class="${wait > 60 ? "bad" : wait > 10 ? "warn" : ""}">${fmtS(wait)}${eta}</td>` +
+    `<td>${fmtN(r.completion_tokens || r.out_tok)}${r.out_tok_r ? ' <span class="dim">(r ' + fmtN(r.out_tok_r) + ')</span>' : ""}</td>` +
+    `<td>${rt ? rt.toFixed(1) : ""}</td><td class="${since > 30 ? "bad" : since > 10 ? "warn" : ""}">${since != null ? fmtS(since) : ""}</td>` +
+    `<td>${esc(r.finish || "")}${tools}${r.err ? ' <span class="bad">!</span>' : ""}</td><td class="last" title="${esc(r.last_input)}">${esc(r.last_input)}</td>`;
+}
+
+function renderRows() {
+  const tb = $("rows");
+  const ids = [...recs.keys()].sort((a, b) => b - a);
+  const html = ids.map(id => `<tr data-id="${id}" class="${id === sel ? "sel" : ""}">${row(recs.get(id))}</tr>`).join("");
+  tb.innerHTML = html;
+}
+$("rows").addEventListener("click", e => { const tr = e.target.closest("tr"); if (tr) { $("follow").checked = false; select(+tr.dataset.id); } });
+
+function renderServer() {
+  const s = srv;
+  const up = s.health === 200;
+  $("health").innerHTML = `<span class="dot" style="background:${up ? "var(--ok)" : "var(--bad)"}"></span>${up ? "vLLM up" : "vLLM " + esc(s.health)}`;
+  $("running").textContent = s.running ?? "-"; $("waiting").textContent = s.waiting ?? "-";
+  $("waiting").className = s.waiting > 0 ? "warn" : "";
+  $("kv").textContent = s.kv_usage != null ? (s.kv_usage * 100).toFixed(1) + "%" : "-";
+  $("phit").textContent = s.prefix_hit != null ? (s.prefix_hit * 100).toFixed(1) + "%" : "-";
+  // live prompt processing: exact engine feed, else estimated from KV-block growth (vLLM's token counters only move
+  // when a request's first output token appears)
+  const live = s.prompt_live != null ? s.prompt_live : s.prompt_live_kv;
+  $("ptps").textContent = live != null ? Math.round(live) + (s.prompt_live == null ? " (≈ from KV)" : "") : "-";
+  $("gtps").textContent = s.gen_tps != null ? s.gen_tps.toFixed(1) : "-";
+  $("acc").textContent = s.accept_len != null ? s.accept_len.toFixed(2) : "-";
+  $("gpus").innerHTML = (s.gpus || []).map(g => `GPU${g.i} <span>${g.util}%</span> ${(g.mem / 1024).toFixed(1)}/${(g.mem_total / 1024).toFixed(0)} GB ${g.temp}°C ${Math.round(g.power)} W`).join(" · ");
+  const active = [...recs.values()].some(r => !r.t_end);
+  const lastEnd = Math.max(0, ...[...recs.values()].map(r => r.t_end || 0));
+  $("idle").innerHTML = active ? "" : lastEnd ? `<span class="warn">server idle ${fmtS(now() - lastEnd)}</span> (waiting for the client)` : "";
+}
+
+function drawTimeline() {
+  const c = $("tl"), w = c.clientWidth, h = c.clientHeight, dpr = window.devicePixelRatio || 1;
+  c.width = w * dpr; c.height = h * dpr;
+  const g = c.getContext("2d"); g.scale(dpr, dpr);
+  const span = 600, t1 = now(), t0 = t1 - span, x = t => (t - t0) / span * (w - 50) + 45;
+  g.fillStyle = "#8a93a6"; g.font = "10px sans-serif";
+  for (let m = 0; m <= 10; m += 2) { const t = t1 - m * 60; g.fillRect(x(t), 0, 1, h); g.fillText(m ? `-${m}m` : "now", x(t) + 2, h - 3); }
+  const vis = [...recs.values()].filter(r => (r.t_end || t1) > t0).sort((a, b) => a.t0 - b.t0);
+  const lanes = [];
+  for (const r of vis) {
+    let l = lanes.findIndex(e => e < r.t0); if (l < 0) { l = lanes.length; lanes.push(0); }
+    lanes[l] = r.t_end || t1;
+    const y = 6 + l * 16; if (y > h - 18) continue;
+    const tf = r.t_first || (r.t_end || t1), te = r.t_end || t1;
+    g.fillStyle = r.state === "error" ? "#f85149" : "#d29922"; g.fillRect(x(Math.max(r.t0, t0)), y, Math.max(1, x(tf) - x(Math.max(r.t0, t0))), 11);
+    if (r.t_first) {
+      const stalled = !r.t_end && t1 - (r.t_last || r.t_first) > 30;
+      g.fillStyle = r.state === "aborted" ? "#bc8cff" : r.state === "error" || stalled ? "#f85149" : "#3fb950";
+      g.fillRect(x(Math.max(tf, t0)), y, Math.max(1, x(te) - x(Math.max(tf, t0))), 11);
+    }
+    g.fillStyle = "#0f1115"; if (x(te) - x(Math.max(r.t0, t0)) > 24) g.fillText("#" + r.id, x(Math.max(r.t0, t0)) + 2, y + 9);
+  }
+  g.fillStyle = "#8a93a6"; g.fillText("amber = waiting (queue + prompt), green = output, red = error / stalled, violet = client aborted", 48, 10 + Math.min(lanes.length, 6) * 16 + 4);
+}
+
+function clip(text, max) {
+  if (text.length <= max) return [esc(text), false];
+  return [esc(text.slice(0, Math.floor(max * 0.7))) + `\n\n… ${fmtN(text.length - max)} chars hidden …\n\n` + esc(text.slice(-Math.floor(max * 0.3))), true];
+}
+
+function textOf(c) {
+  if (c == null) return "";
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.map(p => typeof p === "string" ? p : p.text ?? (p.type && p.type.includes("image") ? "[image]" : p.type === "tool_result" ? textOf(p.content) : p.type === "tool_use" ? "tool_use " + p.name + " " + JSON.stringify(p.input) : JSON.stringify(p))).join("\n");
+  return JSON.stringify(c);
+}
+
+const fullTexts = {};             // element id -> full text of a clipped message
+function msgBox(role, text, extra, open) {
+  const max = open ? 20000 : 1200;
+  const [body, cut] = clip(text, max);
+  const id = "m" + Math.random().toString(36).slice(2);
+  if (cut) fullTexts[id] = text;
+  return `<div class="msg"><div class="role"><span>${esc(role)}</span><span>${fmtN(text.length)} chars${extra ? " · " + esc(extra) : ""}</span></div>` +
+    `<pre id="${id}">${body}</pre>${cut ? `<span class="more" data-full="${id}">show all</span>` : ""}</div>`;
+}
+
+async function select(id) {
+  sel = id; renderRows();
+  const r = await (await fetch("/monitor/api/req/" + id)).json();
+  if (sel !== id) return;
+  selDetail = r; renderDetail();
+}
+
+function renderDetail() {
+  const r = selDetail; if (!r) return;
+  for (const k in fullTexts) delete fullTexts[k];
+  const b = r.body || {};
+  const msgs = Array.isArray(b.messages) ? b.messages : Array.isArray(b.input) ? b.input : b.prompt != null ? [{role: "prompt", content: b.prompt}] : typeof b.input === "string" ? [{role: "user", content: b.input}] : [];
+  let html = `<h3>request ${rid(r.id)} · ${r.kind} · ${esc(r.model)} · ${fmtT(r.t0)}</h3><div class="grid">` +
+    `<div>client</div><div>${esc(r.client)} · ${esc(r.ua)}</div>` +
+    `<div>state</div><div>${status(r)[0]}${r.status ? " · HTTP " + r.status : ""}${r.resp_id ? " · " + esc(r.resp_id) : ""}</div>` +
+    `<div>prompt</div><div>${r.prompt_tokens ?? (r.v ? r.v.prompt : "~" + (r.est_prompt ?? "?"))} tokens${r.cached_tokens != null ? " (" + r.cached_tokens + " cached)" : r.v && r.v.cached >= 0 ? " (" + r.v.cached + " cached)" : ""} · ${r.n_msgs} messages · ${r.n_tools} tools</div>` +
+    (r.v && r.t_first == null && !r.t_end ? `<div>processing</div><div>${r.v.status} · ${r.v.computed} / ${r.v.prompt} prompt tokens in KV${prefillEta(r)}</div>` : "") +
+    `<div>timing</div><div>wait ${fmtS((r.t_first || r.t_end || now()) - r.t0)}${r.t_first ? " · output " + fmtS((r.t_end || now()) - r.t_first) : ""}${rate(r) ? " · " + rate(r).toFixed(1) + " tok/s" : ""}</div>` +
+    `<div>params</div><div>${esc(JSON.stringify(r.params))}</div>` +
+    (r.err ? `<div>error</div><div class="bad">${esc(r.err)}</div>` : "") + `</div>`;
+  html += `<h3>output ${r.finish ? "· finish: " + esc(r.finish) : ""} ${r.usage && Object.keys(r.usage).length ? "· usage " + esc(JSON.stringify(r.usage)) : ""}</h3>`;
+  if (r.reasoning) html += `<details ${r.content ? "" : "open"}><summary class="dim">reasoning (${fmtN(r.reasoning.length)} chars)</summary><pre class="out reason" id="o-r">${esc(r.reasoning)}</pre></details>`;
+  else html += `<pre class="out reason" id="o-r" style="display:none"></pre>`;
+  html += `<pre class="out" id="o-c">${esc(r.content || "")}</pre>`;
+  html += `<div id="o-t">${toolsHtml(r.tools)}</div>`;
+  html += `<h3>input (${msgs.length} messages${b.tools ? ", " + b.tools.length + " tools" : ""})</h3>`;
+  if (b.system) html += msgBox("system (anthropic)", textOf(b.system), "", false);
+  const lastIdx = msgs.length - 1;
+  msgs.forEach((m, i) => {
+    const calls = (m.tool_calls || []).map(tc => `→ ${tc.function ? tc.function.name + "(" + tc.function.arguments + ")" : JSON.stringify(tc)}`).join("\n");
+    const text = textOf(m.content) + (calls ? (m.content ? "\n" : "") + calls : "");
+    html += msgBox(`${i + 1}. ${m.role || m.type || "?"}${m.name ? " " + m.name : ""}${m.tool_call_id ? " ← " + m.tool_call_id : ""}`, text, "", i >= lastIdx - 1);
+  });
+  if (b.tools) html += `<details><summary class="dim">tool definitions</summary><pre class="out">${esc(JSON.stringify(b.tools, null, 1))}</pre></details>`;
+  html += `<details><summary class="dim">raw request JSON</summary><pre class="out">${esc(JSON.stringify(b, null, 1).slice(0, 200000))}</pre></details>`;
+  html += `<div id="journalbox" style="display:${$("journalbox") && $("journalbox").style.display || "none"}"><h3>recent vLLM warnings / errors</h3><div id="journal">${$("journal") ? $("journal").innerHTML : ""}</div></div>`;
+  $("detail").innerHTML = html;
+}
+
+function toolsHtml(tools) {
+  return (tools || []).map(t => `<div class="msg"><div class="role"><span>tool call ${esc(t.name)}</span><span>${esc(t.id)}</span></div><pre>${esc(t.args)}</pre></div>`).join("");
+}
+
+$("detail").addEventListener("click", e => {
+  const id = e.target.dataset && e.target.dataset.full;
+  if (!id || !(id in fullTexts)) return;
+  $(id).textContent = fullTexts[id];
+  delete fullTexts[id];
+  e.target.remove();
+});
+
+$("jbtn").onclick = async () => {
+  const box = $("journalbox"); const show = box.style.display === "none";
+  box.style.display = show ? "block" : "none";
+  if (show) { const j = await (await fetch("/monitor/api/journal")).json(); $("journal").textContent = j.lines.join("\n") || "(none)"; }
+};
+
+function onEvent(ev) {
+  if (ev.t === "hello") { clockSkew = ev.now - Date.now() / 1000; return; }
+  if (ev.t === "srv") { srv = ev.srv; renderServer(); return; }
+  if (ev.t === "s" || ev.t === "p") {
+    const r = ev.rec; const isNew = !recs.has(r.id);
+    recs.set(r.id, r);
+    if (isNew && $("follow").checked) select(r.id);
+    if (ev.t === "p" && r.id === sel && selDetail) {
+      Object.assign(selDetail, r);
+      if (ev.c) { selDetail.content = (selDetail.content || "") + ev.c; const o = $("o-c"); if (o) o.textContent += ev.c; }
+      if (ev.r) { selDetail.reasoning = (selDetail.reasoning || "") + ev.r; const o = $("o-r"); if (o) { o.style.display = ""; o.textContent += ev.r; } }
+      if (ev.tools && ev.tools.length) { selDetail.tools = ev.tools; const o = $("o-t"); if (o) o.innerHTML = toolsHtml(ev.tools); }
+    }
+  }
+}
+
+async function boot() {
+  const d = await (await fetch("/monitor/api/list")).json();
+  clockSkew = d.now - Date.now() / 1000;
+  d.recs.forEach(r => recs.set(r.id, r)); srv = d.srv || {};
+  renderRows(); renderServer();
+  const ids = [...recs.keys()]; if (ids.length) select(Math.max(...ids));
+  const es = new EventSource("/monitor/api/events");
+  es.onmessage = m => onEvent(JSON.parse(m.data));
+  setInterval(() => { renderRows(); renderServer(); drawTimeline(); }, 1000);
+  drawTimeline();
+}
+boot();
+</script>
+</body>
+</html>

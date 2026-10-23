@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-turing"
+version = "0.1.0"
+description = "Turing (sm75) speedups for vLLM, loaded as a vllm.general_plugins entry point"
+requires-python = ">=3.10"
+
+[project.entry-points."vllm.general_plugins"]
+turing = "vllm_turing:register"
+
+[tool.setuptools.packages.find]
+include = ["vllm_turing*"]
+
+[tool.setuptools.package-data]
+vllm_turing = ["csrc/*.cu"]
